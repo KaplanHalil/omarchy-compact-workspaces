@@ -120,6 +120,19 @@ BarWidget {
     return String(Hyprland.focusedMonitor.name) === root.screenName
   }
 
+  // One bar surface exists per monitor and every copy sees the same Hyprland
+  // events. Compaction is a global operation, so exactly one copy may run it:
+  // the focused monitor's bar while the session is live, and the first
+  // monitor's bar during startup before focus is known.
+  readonly property bool compactionLeader: {
+    var _ = root.revision
+    var monitors = Hyprland.monitors.values
+    if (!monitors || monitors.length === 0) return true
+    if (root.screenName === "") return monitors.length === 1
+    if (Hyprland.focusedMonitor) return String(Hyprland.focusedMonitor.name) === root.screenName
+    return String(monitors[0].name) === root.screenName
+  }
+
   // --- keeping Hyprland's view fresh ---------------------------------------
   // Quickshell does not refetch toplevels or workspaces on its own, so window
   // and workspace events have to poke it or occupancy goes stale. `revision`
@@ -387,14 +400,14 @@ BarWidget {
     interval: 1800
     repeat: false
     onTriggered: {
-      if (!root.compactIds || !root.compactOnStart) return
+      if (!root.compactIds || !root.compactOnStart || !root.compactionLeader) return
       root.compactQueued = false
       root.startCompaction()
     }
   }
 
   function scheduleCompaction() {
-    if (!root.compactIds) return
+    if (!root.compactIds || !root.compactionLeader) return
     // Events emitted by our own change_id dispatches are not new holes.
     if (root.compacting) return
     root.compactQueued = true
@@ -402,7 +415,7 @@ BarWidget {
   }
 
   function startCompaction() {
-    if (!root.compactIds) {
+    if (!root.compactIds || !root.compactionLeader) {
       root.compactQueued = false
       return
     }

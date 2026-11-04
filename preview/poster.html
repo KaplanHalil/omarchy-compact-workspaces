@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Compact Workspaces — marketplace preview</title>
+<style>
+  :root {
+    --bg: #060B1E;
+    --fg: #FFCEAD;
+    --fg-soft: #f0ddcf;
+    --muted: #9a93bd;
+    --accent: #7d82d9;
+    --line: rgba(255, 206, 173, .16);
+    --mono: "JetBrainsMono Nerd Font", "JetBrains Mono", monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 1600px;
+    height: 1000px;
+    background: var(--bg);
+    overflow: hidden;
+  }
+
+  .stage {
+    position: relative;
+    width: 1600px;
+    height: 1000px;
+    background:
+      radial-gradient(820px 640px at 88% 42%, rgba(125, 130, 217, .22), transparent 64%),
+      radial-gradient(900px 700px at 4% 0%, rgba(255, 206, 173, .12), transparent 60%),
+      linear-gradient(140deg, #060B1E 0%, #0a1030 48%, #120a26 100%);
+    font-family: var(--mono);
+    color: var(--fg-soft);
+  }
+
+  .wall {
+    position: absolute;
+    inset: -70px;
+    background: url(wallpaper.jpg) center / cover no-repeat;
+    filter: blur(48px) saturate(1.15);
+    opacity: .34;
+    transform: scale(1.08);
+  }
+
+  .vignette {
+    position: absolute;
+    inset: 0;
+    background:
+      linear-gradient(90deg, #060B1E 0%, rgba(6, 11, 30, .95) 36%, rgba(6, 11, 30, .18) 66%, rgba(6, 11, 30, 0) 100%),
+      radial-gradient(130% 120% at 55% 48%, transparent 46%, rgba(3, 6, 18, .82) 100%);
+  }
+
+  .grid {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, .035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, .035) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(74% 74% at 26% 44%, #000 18%, transparent 76%);
+    opacity: .5;
+  }
+
+  .copy {
+    position: absolute;
+    left: 96px;
+    top: 196px;
+    width: 610px;
+  }
+
+  .eyebrow {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 13px;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  .eyebrow::before {
+    content: "";
+    width: 32px;
+    height: 1px;
+    background: var(--accent);
+    opacity: .8;
+  }
+
+  h1 {
+    margin-top: 20px;
+    font-size: 66px;
+    line-height: .98;
+    letter-spacing: -.035em;
+    color: var(--fg);
+    font-weight: 700;
+  }
+
+  h1 em {
+    font-style: normal;
+    color: var(--accent);
+  }
+
+  .lede {
+    margin-top: 26px;
+    font-size: 17px;
+    line-height: 1.62;
+    color: var(--muted);
+    max-width: 540px;
+  }
+
+  .lede strong { color: var(--fg-soft); font-weight: 500; }
+
+  .rules {
+    margin-top: 38px;
+    display: grid;
+    gap: 15px;
+    font-size: 15px;
+    color: var(--fg-soft);
+  }
+
+  .rule {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+
+  .rule b {
+    display: inline-grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    flex: 0 0 22px;
+    border: 1px solid rgba(125, 130, 217, .55);
+    border-radius: 2px;
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  .rule span { color: var(--muted); }
+  .rule span strong { color: var(--fg-soft); font-weight: 500; }
+
+  .foot {
+    position: absolute;
+    left: 96px;
+    bottom: 72px;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-size: 12px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .foot i {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: .8;
+  }
+
+  /* ------------------------------------------------------------- hero side */
+
+  .hero {
+    position: absolute;
+    right: 72px;
+    top: 176px;
+    width: 800px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .state {
+    position: relative;
+    border: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(19, 26, 58, .82), rgba(6, 11, 30, .72));
+    box-shadow: 0 34px 90px rgba(0, 0, 0, .45);
+    padding: 22px 24px 20px;
+  }
+
+  .state + .state { margin-top: 0; }
+
+  .state .label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    letter-spacing: .2em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 16px;
+  }
+
+  .state .label .tag {
+    color: var(--accent);
+    border: 1px solid rgba(125, 130, 217, .45);
+    padding: 3px 8px;
+    letter-spacing: .16em;
+  }
+
+  .state.after {
+    border-color: rgba(125, 130, 217, .55);
+    background: linear-gradient(180deg, rgba(37, 46, 86, .72), rgba(8, 14, 38, .82));
+  }
+
+  .state img {
+    display: block;
+    width: 100%;
+    height: auto;
+    image-rendering: auto;
+  }
+
+  .arrow {
+    align-self: center;
+    width: 34px;
+    height: 34px;
+    margin: -17px 0;
+    display: grid;
+    place-items: center;
+    border: 1px solid rgba(125, 130, 217, .55);
+    background: #0a1030;
+    color: var(--accent);
+    font-size: 16px;
+    z-index: 2;
+  }
+
+  .caption {
+    margin-top: 22px;
+    font-size: 14px;
+    line-height: 1.55;
+    color: var(--muted);
+    padding-left: 2px;
+  }
+
+  .caption strong { color: var(--fg-soft); font-weight: 500; }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <div class="wall"></div>
+    <div class="grid"></div>
+    <div class="vignette"></div>
+
+    <div class="copy">
+      <div class="eyebrow">Omarchy bar widget</div>
+      <h1>Compact<br><em>Workspaces</em></h1>
+      <p class="lede">
+        Hyprland never reuses the id a closed workspace leaves behind. This
+        widget moves the live workspaces back down, so the bar stays
+        <strong>1 2 3 4</strong> instead of drifting into <strong>1 2 3 7</strong>.
+      </p>
+
+      <div class="rules">
+        <div class="rule"><b>01</b><span><strong>Gap-free numbering.</strong> Windows move with their workspace.</span></div>
+        <div class="rule"><b>02</b><span><strong>Real app icons</strong> beside every workspace number.</span></div>
+        <div class="rule"><b>03</b><span><strong>Square chips</strong> with a border from the active theme.</span></div>
+        <div class="rule"><b>04</b><span><strong>Per monitor</strong> and scratchpad aware.</span></div>
+      </div>
+
+    </div>
+
+    <div class="foot">
+      <span>Hyprland 0.56+</span><i></i>
+      <span>Omarchy Quattro</span><i></i>
+      <span>MIT</span>
+    </div>
+
+    <div class="hero">
+      <div class="state before">
+        <div class="label"><span>Before</span><span class="tag">gaps</span></div>
+        <img src="before.png" alt="Workspace pills reading 1 2 3 7 8 9">
+      </div>
+
+      <div class="arrow">↓</div>
+
+      <div class="state after">
+        <div class="label"><span>After</span><span class="tag">compacted</span></div>
+        <img src="after.png" alt="Workspace pills reading 1 2 3 4 5 6">
+      </div>
+
+      <p class="caption">
+        Closing an empty workspace triggers one debounced pass. Each id above
+        the hole moves down one slot, <strong>windows included</strong>.
+      </p>
+    </div>
+  </div>
+</body>
+</html>

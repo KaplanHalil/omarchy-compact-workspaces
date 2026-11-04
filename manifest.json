@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.kaplanhalil.compact-workspaces",
   "name": "Compact Workspaces",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Halil Kaplan",
   "license": "MIT",
   "description": "Workspace pills with real app icons that close the gaps Hyprland leaves behind, plus square theme-bordered chips.",

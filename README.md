@@ -1,5 +1,7 @@
 # Compact Workspaces
 
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-ffdd00?style=flat-square&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/kaplanhalil)
+
 Workspace pills for the Omarchy bar that show only the workspaces you use,
 draw each window with its real application logo, and **close the holes Hyprland
 leaves behind**.
@@ -158,6 +160,12 @@ omarchy plugin validate .
 /usr/lib/qt6/bin/qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" Workspaces.qml
 omarchy restart shell
 ```
+
+## Support
+
+If Compact Workspaces is useful to you, you can buy me a coffee:
+
+[Buy Me a Coffee](https://buymeacoffee.com/kaplanhalil)
 
 ## Credits
 

@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "name": "compact-workspaces-tests",
+  "description": "Node-only tests for the plugin's pure workspace and icon logic. The widget itself needs a running Hyprland session.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kaplanhalil.compact-workspaces",
+  "name": "Compact Workspaces",
+  "version": "1.0.0",
+  "author": "Halil Kaplan",
+  "license": "MIT",
+  "description": "Workspace pills with real app icons that close the gaps Hyprland leaves behind, plus square theme-bordered chips.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Workspaces.qml"
+  },
+  "barWidget": {
+    "displayName": "Compact Workspaces",
+    "description": "Only the workspaces in use, with real app icons and gap-free numbering",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "left",
+    "defaults": {
+      "compactIds": true,
+      "compactOnStart": true,
+      "pillRadius": 2,
+      "borderWidth": 1
+    }
+  }
+}

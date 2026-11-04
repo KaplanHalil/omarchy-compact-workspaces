@@ -1,0 +1,1223 @@
+import QtQuick
+import QtQuick.Layouts
+import Quickshell
+import Quickshell.Hyprland
+import Quickshell.Io
+import Quickshell.Widgets
+import qs.Commons
+import qs.Ui
+import "IconRules.js" as IconRules
+import "IconLogic.js" as IconLogic
+import "WorkspaceLogic.js" as WorkspaceLogic
+
+// Workspace indicators that show only what is actually there: workspaces with
+// windows on them, filtered to the monitor this bar instance lives on, each
+// labelled with its number plus an icon per open window.
+//
+// Everything past that default is opt-in: `showEmpty` keeps every workspace
+// number on the bar whether or not it holds windows, `localWorkspaceNumbers`
+// relabels per-monitor banks so each bar counts from 1, and `showScratchpad`
+// adds a pill for Hyprland's special:scratchpad while something is parked in
+// it.
+BarWidget {
+  id: root
+  moduleName: "io.github.ehlxr.advanced-workspaces"
+
+  // --- settings, read from this widget's shell.json layout entry ------------
+  readonly property bool perMonitor: root.setting("perMonitor", true)
+  readonly property bool showEmpty: root.setting("showEmpty", false)
+  readonly property bool showIcons: root.setting("showIcons", true)
+  // 0 = show an icon for every window; otherwise overflow collapses to "+N".
+  readonly property int maxIcons: root.setting("maxIcons", 0)
+  // Draw each window's real logo from its desktop entry and the system icon
+  // theme instead of the Nerd Font glyph. Falls back to the glyph whenever no
+  // entry or no icon resolves, so the bar is never worse off for it.
+  readonly property bool systemIcons: root.setting("systemIcons", true)
+  // Fetch brand logos over the network when nothing local resolves, and for
+  // browser tabs whose site has one. Off by default: it is the only part of
+  // this widget that talks to the network. What leaves the machine is a brand
+  // slug from the tables in IconRules.js — titles are matched locally.
+  readonly property bool remoteIcons: root.setting("remoteIcons", false)
+  // `{slug}` is replaced with the brand slug, so any host serving an image at
+  // that URL works and a self-hosted mirror is one setting away.
+  readonly property string remoteIconSource: root.setting("remoteIconSource",
+    "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/png/{slug}.png")
+  // Per-app icon overrides, for when the resolved logo is not the one you want:
+  //
+  //   "iconOverrides": {
+  //     "zen": "zen-browser",              // an icon-theme name
+  //     "title:LibrePods": "me.kavishdevar.librepods",   // one window, by title
+  //     "code": "󰨞",                        // a literal glyph, drawn as text
+  //     "steam": "/home/me/steam.png"      // or an image by path
+  //   }
+  //
+  // A class key matches in any case, and an override outranks every other
+  // source including the site table.
+  readonly property var iconOverrides: root.setting("iconOverrides", ({}))
+  readonly property int maxWorkspaceId: root.setting("maxWorkspaceId", 10)
+  // Label each monitor's bank as 1..workspacesPerMonitor instead of using the
+  // global Hyprland id. Display only; ids and dispatches stay global.
+  readonly property bool localWorkspaceNumbers: root.setting("localWorkspaceNumbers", false)
+  readonly property int workspacesPerMonitor: Math.max(1, root.setting("workspacesPerMonitor", 10))
+  // The scratchpad pill appears only while the special workspace holds
+  // windows, so it costs nothing on a bar that never uses it.
+  readonly property bool showScratchpad: root.setting("showScratchpad", true)
+  readonly property string scratchpadName: root.setting("scratchpadName", "special:scratchpad")
+  readonly property string scratchpadLabel: root.setting("scratchpadLabel", "S")
+
+  // --- compaction ----------------------------------------------------------
+  // Hyprland never reuses the numeric id a destroyed workspace leaves behind,
+  // so a bar can end up reading 1 2 3 7. Moving the live workspaces back down
+  // with `change_id` closes those holes for real, windows included, which
+  // keeps the bar labels and the SUPER+number keybinds in agreement.
+  //
+  // This changes workspace ids. A workspace rule or an external script that
+  // pins an app to a specific id will now point at a different workspace; set
+  // `compactIds` to false to keep Hyprland's original ids untouched.
+  readonly property bool compactIds: root.setting("compactIds", true)
+  readonly property bool compactOnStart: root.setting("compactOnStart", true)
+  readonly property int compactDebounce: root.numberSetting("compactDebounce", 120, 0)
+
+  // --- pill design ---------------------------------------------------------
+  // Square-ish pills with a theme-coloured border. The stock shell radius is
+  // 0 on this theme, so 2px reads square while still softening the corners.
+  readonly property int pillRadius: root.numberSetting("pillRadius", 2, 0)
+  readonly property int pillBorderWidth: root.numberSetting("borderWidth", 1, 0)
+
+  readonly property color fgColor: root.bar ? root.bar.barForeground : Color.foreground
+  readonly property color bgColor: root.bar ? root.bar.background : Color.background
+  readonly property color urgentColor: Color.urgent
+  readonly property real trailingGap: root.vertical ? 0 : Style.spaceReal(15)
+
+  // --- which monitor is this bar on ----------------------------------------
+  // One bar surface exists per monitor, so the widget reads its own screen off
+  // the window it was instantiated into rather than off any global focus state.
+  readonly property var barWindow: root.QsWindow ? root.QsWindow.window : null
+  readonly property string screenName: barWindow && barWindow.screen ? String(barWindow.screen.name || "") : ""
+
+  readonly property var hyprMonitor: {
+    var _ = root.revision
+    if (root.screenName === "") return null
+    var monitors = Hyprland.monitors.values
+    for (var i = 0; i < monitors.length; i++) {
+      if (String(monitors[i].name) === root.screenName) return monitors[i]
+    }
+    return null
+  }
+
+  // The workspace active *on this monitor*, which is not the same as the
+  // globally focused workspace once a second monitor exists.
+  readonly property int activeId: {
+    if (root.hyprMonitor && root.hyprMonitor.activeWorkspace) return root.hyprMonitor.activeWorkspace.id
+    return Hyprland.focusedWorkspace ? Hyprland.focusedWorkspace.id : -1
+  }
+
+  // Whether this monitor is the one holding keyboard focus, used to keep the
+  // active pill on the other monitors visibly quieter.
+  readonly property bool monitorFocused: {
+    var _ = root.revision
+    if (root.screenName === "" || !Hyprland.focusedMonitor) return true
+    return String(Hyprland.focusedMonitor.name) === root.screenName
+  }
+
+  // --- keeping Hyprland's view fresh ---------------------------------------
+  // Quickshell does not refetch toplevels or workspaces on its own, so window
+  // and workspace events have to poke it or occupancy goes stale. `revision`
+  // is bumped alongside so bindings below re-evaluate on events that change
+  // nothing Quickshell exposes as a property (focusedmon, urgent).
+  property int revision: 0
+
+  readonly property var windowEvents: ["openwindow", "closewindow", "movewindow", "movewindowv2", "windowtitle", "windowtitlev2", "activewindow", "activewindowv2", "urgent"]
+  readonly property var workspaceEvents: ["workspace", "workspacev2", "createworkspace", "createworkspacev2", "destroyworkspace", "destroyworkspacev2", "moveworkspace", "moveworkspacev2", "focusedmon", "configreloaded"]
+  // Toggling the scratchpad open or shut changes which monitor is showing it,
+  // which only the monitors payload carries.
+  readonly property var specialEvents: ["activespecial", "activespecialv2"]
+
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      var name = event.name
+      // A workspace is destroyed once it is empty and no longer visible. That
+      // is the moment a hole appears in the id sequence, so it is the moment
+      // to close it. Compaction is debounced because emptying several
+      // workspaces in a row emits several of these events.
+      if (name === "destroyworkspace" || name === "destroyworkspacev2") {
+        root.scheduleCompaction()
+      }
+      if (root.windowEvents.indexOf(name) !== -1) {
+        Hyprland.refreshToplevels()
+        root.revision++
+      } else if (root.workspaceEvents.indexOf(name) !== -1) {
+        Hyprland.refreshWorkspaces()
+        if (name === "configreloaded" && root.rulesNeeded) root.refreshRules()
+        root.revision++
+      } else if (root.specialEvents.indexOf(name) !== -1) {
+        Hyprland.refreshWorkspaces()
+        Hyprland.refreshMonitors()
+        root.revision++
+      }
+    }
+  }
+
+  // --- model ---------------------------------------------------------------
+  function hasWindows(workspace) {
+    if (!workspace) return false
+    var tops = workspace.toplevels ? workspace.toplevels.values : null
+    return !!tops && tops.length > 0
+  }
+
+  // Hyprland reports the owning monitor as an object on the workspace and as a
+  // bare name string in the raw IPC payload; either will do.
+  function monitorNameOf(workspace) {
+    if (!workspace) return ""
+    if (workspace.monitor && workspace.monitor.name) return String(workspace.monitor.name)
+    var ipc = workspace.lastIpcObject
+    if (ipc && ipc.monitor) return String(ipc.monitor)
+    return ""
+  }
+
+  function workspaceById(id) {
+    var _ = root.revision
+    var values = Hyprland.workspaces.values
+    for (var i = 0; i < values.length; i++) {
+      if (values[i].id === id) return values[i]
+    }
+    return null
+  }
+
+  // --- workspace rules, only needed to place empty numbers -----------------
+  // Hyprland only reports workspaces that currently exist, so `showEmpty` has
+  // to synthesise the missing ids rather than filter live objects — and then
+  // decide which bar each synthesised id belongs on. Rules answer that for
+  // both sequential (1-5 / 6-10) and interleaved (odds / evens) layouts; live
+  // occupancy still wins wherever a workspace has already been created.
+  property var workspaceRules: []
+  property bool rulesPending: false
+  property bool rulesLoaded: false
+  readonly property bool rulesNeeded: root.showEmpty && root.perMonitor
+
+  function refreshRules() {
+    if (rulesProc.running) {
+      root.rulesPending = true
+      return
+    }
+    rulesProc.running = true
+  }
+
+  onRulesNeededChanged: if (root.rulesNeeded && !root.rulesLoaded) root.refreshRules()
+  Component.onCompleted: {
+    if (root.rulesNeeded) root.refreshRules()
+    root.collectRemoteIcons()
+    // Give Hyprland a moment to finish restoring the session before touching
+    // workspace ids, so the first compaction sees the real workspace set.
+    if (root.compactIds && root.compactOnStart) compactStartup.start()
+  }
+
+  function ruleMonitorMatches(spec, mine, mineDesc) {
+    if (!spec) return false
+    var value = String(spec)
+    if (value === mine) return true
+    if (value.indexOf("desc:") === 0) {
+      var desc = value.slice(5)
+      return mineDesc !== "" && desc === mineDesc
+    }
+    return false
+  }
+
+  function resolveRuleMonitor(spec) {
+    var _ = root.revision
+    if (!spec) return ""
+    var monitors = Hyprland.monitors.values
+    for (var i = 0; i < monitors.length; i++) {
+      var name = String(monitors[i].name)
+      var desc = ""
+      var ipc = monitors[i].lastIpcObject
+      if (ipc && ipc.description) desc = String(ipc.description)
+      else if (monitors[i].description) desc = String(monitors[i].description)
+      if (root.ruleMonitorMatches(spec, name, desc)) return name
+    }
+    return ""
+  }
+
+  function ruleOwnerById(maxId) {
+    var rules = root.workspaceRules
+    var map = {}
+    for (var i = 0; i < rules.length; i++) {
+      var id = rules[i].id
+      if (id <= 0 || id > maxId) continue
+      var name = root.resolveRuleMonitor(rules[i].monitor)
+      if (name) map[id] = name
+    }
+    return map
+  }
+
+  Process {
+    id: rulesProc
+    command: ["hyprctl", "-j", "workspacerules"]
+    onRunningChanged: {
+      if (!running && root.rulesPending) {
+        root.rulesPending = false
+        root.refreshRules()
+      }
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var listed
+        try {
+          listed = JSON.parse(text || "[]")
+        } catch (e) {
+          return
+        }
+        if (!Array.isArray(listed)) return
+        var parsed = []
+        for (var i = 0; i < listed.length; i++) {
+          var row = listed[i]
+          if (!row || row.enabled === false) continue
+          var id = parseInt(row.workspaceString, 10)
+          if (!(id > 0)) continue
+          parsed.push({ id: id, monitor: String(row.monitor || "") })
+        }
+        root.workspaceRules = parsed
+        root.rulesLoaded = true
+        root.revision++
+      }
+    }
+  }
+
+  // The pills, as ids. Ids rather than workspace objects, because a
+  // synthesised empty number has no object behind it until it is focused.
+  readonly property var visibleIds: {
+    var _ = root.revision
+    var __ = root.workspaceRules
+    var ___ = root.rulesLoaded
+    var mine = root.screenName
+    var active = root.activeId
+    var maxId = root.maxWorkspaceId
+    var values = Hyprland.workspaces.values
+
+    var mineIds = []
+    var occupied = []
+    var owners = {}
+    var known = []
+
+    for (var i = 0; i < values.length; i++) {
+      var workspace = values[i]
+      var id = workspace.id
+      if (id <= 0 || id > maxId) continue
+
+      var owner = root.monitorNameOf(workspace)
+      if (owner !== "") {
+        owners[id] = owner
+        known.push(id)
+      }
+
+      // An unknown owner is kept rather than dropped: better a stray pill
+      // than a workspace that silently vanishes from every bar.
+      if (root.perMonitor && mine !== "" && owner !== "" && owner !== mine) continue
+      mineIds.push(id)
+
+      // The active workspace stays pinned even when empty, otherwise stepping
+      // onto a fresh workspace leaves the bar with nothing to point at.
+      if (root.hasWindows(workspace) || id === active) occupied.push(id)
+    }
+    known.sort(function(left, right) { return left - right })
+
+    if (!root.showEmpty) {
+      occupied.sort(function(left, right) { return left - right })
+      return occupied
+    }
+
+    if (!root.perMonitor) {
+      var all = []
+      for (var n = 1; n <= maxId; n++) all.push(n)
+      return all
+    }
+
+    if (mine === "") return []
+
+    // Live-only until the first workspacerules read; [] means "not loaded"
+    // and "no rules" otherwise, and fallback would flash the wrong layout.
+    if (!root.rulesLoaded) {
+      var pending = mineIds.slice()
+      if (active > 0 && active <= maxId && pending.indexOf(active) === -1) {
+        if (owners[active] === undefined || owners[active] === mine) pending.push(active)
+      }
+      pending.sort(function(left, right) { return left - right })
+      return pending
+    }
+
+    var ruleOwners = root.ruleOwnerById(maxId)
+    var firstOwner = known.length > 0 ? owners[known[0]] : ""
+    var pred = 0
+    var filled = []
+    for (var id2 = 1; id2 <= maxId; id2++) {
+      if (owners[id2]) pred = id2
+      var owner2 = owners[id2] || ruleOwners[id2] || (pred > 0 ? owners[pred] : firstOwner)
+      if (owner2 === mine) filled.push(id2)
+    }
+    if (filled.length === 0 && active > 0 && active <= maxId && (owners[active] === undefined || owners[active] === mine)) {
+      return [active]
+    }
+    return filled
+  }
+
+  // --- closing the gaps in the workspace id sequence -----------------------
+  // The planning rules live in WorkspaceLogic.js so they can be tested under
+  // Node; this block only turns a plan into dispatches, one at a time, and
+  // keeps the widget's own workspace events from re-triggering itself.
+  property bool compacting: false
+  property bool compactQueued: false
+  property int compactRetries: 0
+  property var compactPlan: []
+  property int compactPlanIndex: 0
+
+  Timer {
+    id: compactSchedule
+    interval: Math.max(0, root.compactDebounce)
+    repeat: false
+    onTriggered: root.startCompaction()
+  }
+
+  // Session restore can create workspaces after the widget is constructed.
+  // Waiting a moment means the first plan sees the complete set and closes
+  // every existing hole in one pass instead of one per restore event.
+  Timer {
+    id: compactStartup
+    interval: 1800
+    repeat: false
+    onTriggered: {
+      if (!root.compactIds || !root.compactOnStart) return
+      root.compactQueued = false
+      root.startCompaction()
+    }
+  }
+
+  function scheduleCompaction() {
+    if (!root.compactIds) return
+    // Events emitted by our own change_id dispatches are not new holes.
+    if (root.compacting) return
+    root.compactQueued = true
+    compactSchedule.restart()
+  }
+
+  function startCompaction() {
+    if (!root.compactIds) {
+      root.compactQueued = false
+      return
+    }
+    if (root.compacting) return
+    root.compacting = true
+    root.compactQueued = false
+    root.compactPlan = []
+    root.compactPlanIndex = 0
+    compactProbe.running = true
+  }
+
+  function runNextCompactionStep() {
+    if (root.compactPlanIndex >= root.compactPlan.length) {
+      root.finishCompaction(false)
+      return
+    }
+    var step = root.compactPlan[root.compactPlanIndex]
+    compactApply.command = [
+      "hyprctl", "dispatch",
+      'hl.dsp.workspace.change_id({ workspace = "' + step.from + '", id = ' + step.to + ' })'
+    ]
+    compactApply.running = true
+  }
+
+  function finishCompaction(retry) {
+    root.compacting = false
+    root.compactPlan = []
+    root.compactPlanIndex = 0
+    Hyprland.refreshWorkspaces()
+    root.revision++
+
+    // A failed move usually means another workspace claimed the target while
+    // the plan was running. Re-reading the live list is enough to replan; two
+    // attempts cover a race without turning a stuck dispatch into a loop.
+    if (retry && root.compactRetries < 2) {
+      root.compactRetries++
+      compactSchedule.interval = 200
+      compactSchedule.restart()
+      return
+    }
+
+    root.compactRetries = 0
+    compactSchedule.interval = Math.max(0, root.compactDebounce)
+    if (root.compactQueued) {
+      root.compactQueued = false
+      compactSchedule.restart()
+    }
+  }
+
+  Process {
+    id: compactProbe
+    command: ["hyprctl", "-j", "workspaces"]
+    stdout: StdioCollector {
+      id: compactProbeOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.finishCompaction(true)
+        return
+      }
+      var rows
+      try {
+        rows = JSON.parse(String(compactProbeOut.text || "[]"))
+      } catch (error) {
+        root.finishCompaction(true)
+        return
+      }
+      if (!Array.isArray(rows)) {
+        root.finishCompaction(true)
+        return
+      }
+
+      var live = []
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i]
+        if (!row) continue
+        live.push({ id: Number(row.id), monitor: String(row.monitor || "") })
+      }
+
+      root.compactPlan = WorkspaceLogic.planCompaction(live, "")
+      root.compactPlanIndex = 0
+      if (root.compactPlan.length === 0) {
+        root.finishCompaction(false)
+        return
+      }
+      root.runNextCompactionStep()
+    }
+  }
+
+  Process {
+    id: compactApply
+    stdout: StdioCollector {
+      id: compactApplyOut
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: compactApplyErr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      var out = String(compactApplyOut.text || "")
+      var err = String(compactApplyErr.text || "")
+      var failed = exitCode !== 0 || /^\s*error/i.test(out) || /^\s*error/i.test(err)
+      if (failed) {
+        root.finishCompaction(true)
+        return
+      }
+      root.compactPlanIndex++
+      Hyprland.refreshWorkspaces()
+      root.revision++
+      root.runNextCompactionStep()
+    }
+  }
+
+  // --- scratchpad -----------------------------------------------------------
+  // Hyprland keeps special:scratchpad in the workspace list for as long as it
+  // holds windows, whether or not it is currently toggled open. It belongs to
+  // no monitor in any lasting sense, so the pill shows up on every bar.
+  readonly property var scratchpadWorkspace: {
+    var _ = root.revision
+    if (!root.showScratchpad) return null
+    var values = Hyprland.workspaces.values
+    for (var i = 0; i < values.length; i++) {
+      if (String(values[i].name || "") === root.scratchpadName) return values[i]
+    }
+    return null
+  }
+
+  readonly property bool scratchpadVisible: root.showScratchpad && root.hasWindows(root.scratchpadWorkspace)
+
+  // Open on *this* monitor, which is the only place the stash is reachable
+  // from right now.
+  readonly property bool scratchpadOpen: {
+    var _ = root.revision
+    if (!root.hyprMonitor) return false
+    var ipc = root.hyprMonitor.lastIpcObject
+    var special = ipc ? ipc.specialWorkspace : null
+    return !!special && String(special.name || "") === root.scratchpadName
+  }
+
+  function toggleScratchpad() {
+    if (!root.bar) return
+    var name = root.scratchpadName.indexOf("special:") === 0 ? root.scratchpadName.slice(8) : root.scratchpadName
+    root.bar.run("hyprctl dispatch " + Util.shellQuote('hl.dsp.workspace.toggle_special("' + name + '")'))
+  }
+
+  // --- icons ---------------------------------------------------------------
+  function windowClass(toplevel) {
+    var ipc = toplevel ? toplevel.lastIpcObject : null
+    if (ipc && ipc.class) return ipc.class
+    if (toplevel && toplevel.class) return toplevel.class
+    if (toplevel && toplevel.appId) return toplevel.appId
+    return ""
+  }
+
+  function windowTitle(toplevel) {
+    if (toplevel && toplevel.title) return toplevel.title
+    var ipc = toplevel ? toplevel.lastIpcObject : null
+    if (ipc && ipc.title) return ipc.title
+    return ""
+  }
+
+  // Physical pixels for the icon decode. A 16px logo asked for as 16px comes
+  // back as a 16px bitmap and is upscaled by the compositor on a HiDPI screen,
+  // so the source is requested at the physical size instead.
+  readonly property real devicePixelRatio: {
+    var screens = Quickshell.screens
+    for (var i = 0; i < screens.length; i++) {
+      if (String(screens[i].name) === root.screenName) return screens[i].devicePixelRatio || 1
+    }
+    return 1
+  }
+
+  // Logo size and spacing, in pixels. A logo is drawn smaller than the bar's
+  // icon canvas because at the canvas size it crowded the workspace number, and
+  // `iconGap` is the space between two entries in a pill - so it separates one
+  // logo from the next as well as from the number.
+  // Numeric settings arrive as JSON values, so coerce them rather than trusting
+  // a hand-edited shell.json to hold a number.
+  function numberSetting(name, fallback, minimum) {
+    var value = Number(root.setting(name, fallback))
+    if (!isFinite(value)) return fallback
+    return Math.max(minimum, Math.round(value))
+  }
+
+  function pixelSetting(name, fallback, minimum) {
+    return root.numberSetting(name, fallback, minimum)
+  }
+
+  readonly property int iconSize: root.pixelSetting("iconSize", Math.round(Style.bar.iconCanvas * 0.8), 6)
+  readonly property int iconGap: root.pixelSetting("iconGap", Math.round(Style.spaceReal(4)), 0)
+  // The logo tile follows the pill's square treatment. It never rounds further
+  // than half the tile, so a large pill radius cannot turn the icon into a
+  // circle that no longer matches the pill it sits in.
+  readonly property int iconTileRadius: Math.max(0, Math.min(root.pillRadius, Math.round(root.iconSize / 2)))
+
+  // Desktop entries are scanned asynchronously and only land a second or two
+  // after the shell starts, so an icon resolved before then must be discarded
+  // rather than cached as "no logo exists". Swapping the map and bumping
+  // desktopRevision re-runs the bindings that build the icon rows.
+  property var systemIconCache: ({})
+  property int desktopRevision: 0
+
+  Connections {
+    target: DesktopEntries
+    function onApplicationsChanged() {
+      root.systemIconCache = ({})
+      root.desktopRevision++
+    }
+  }
+
+  // The desktop entry for a window class, or null. An exact id match is tried
+  // first and wins outright: heuristicLookup scores by name and exec similarity,
+  // so a short or generic class can lose to a worse entry even when the id is
+  // identical. byId takes the id without its .desktop suffix.
+  function desktopEntryFor(cls) {
+    var exact = null
+    try { exact = DesktopEntries.byId(cls) } catch (e) { exact = null }
+    if (exact) return exact
+    try { return DesktopEntries.heuristicLookup(cls) } catch (e) { return null }
+  }
+
+  // The desktop entry is the only place that knows an application's icon name,
+  // and the window class is not it: Vivaldi's class is `vivaldi-stable` while
+  // its icon is `vivaldi`, and VS Code's class is `code` while its icon is
+  // `vscode`. Quickshell.iconPath then resolves that name against the icon
+  // theme, which also covers /usr/share/pixmaps and the GTK theme.
+  function systemIconSource(cls) {
+    if (!root.systemIcons || cls === "") return ""
+    var cached = root.systemIconCache[cls]
+    if (cached !== undefined) return cached
+
+    var source = ""
+    var entry = root.desktopEntryFor(cls)
+    if (entry && entry.icon) {
+      var name = String(entry.icon)
+      // An entry may name a file outright; there is nothing to theme-resolve.
+      if (name.charAt(0) === "/") source = Util.fileUrl(name)
+      else if (name.indexOf("file://") === 0 || name.indexOf("image://") === 0) source = name
+      else source = Quickshell.iconPath(name, true)
+    }
+
+    root.systemIconCache[cls] = source
+    return source
+  }
+
+  // --- brand logos over the network ----------------------------------------
+  // Opt-in, and the only thing here that leaves the machine. What is sent is a
+  // brand slug from the tables in IconRules.js — never a window title or a
+  // class — and what comes back is cached on disk, so each slug is fetched once
+  // and survives restarts.
+  readonly property string remoteIconDir: {
+    var base = Quickshell.env("XDG_CACHE_HOME")
+    if (!base || base === "") {
+      var home = Quickshell.env("HOME")
+      base = (home && home !== "") ? home + "/.cache" : "/tmp"
+    }
+    return base + "/advanced-workspaces/icons"
+  }
+
+  // Slugs already on disk, slugs being fetched, and slugs that came back empty.
+  // The last one keeps a slug the host does not have from being retried on
+  // every render.
+  property var remoteReady: ({})
+  property var remotePending: ({})
+  property var remoteFailed: ({})
+  property var remoteQueue: []
+  property bool remoteScanStarted: false
+  property bool remoteScanDone: false
+  property int remoteRevision: 0
+
+  // Hard cap for a single logo download. Logo tiles are a few dozen kilobytes;
+  // anything larger than this is either not a logo or not one we want on disk.
+  readonly property int remoteMaxBytes: 1048576
+
+  // A slug reduced to characters that are safe in a file name. Slugify already
+  // narrows most inputs to [a-z0-9-], but the rule table's site logos skip
+  // slugify, and every cache file name is derived here.
+  function remoteFileName(slug) {
+    return IconLogic.fileName(slug)
+  }
+
+  function remoteTarget(slug) {
+    return root.remoteIconDir + "/" + root.remoteFileName(slug) + ".png"
+  }
+
+  // `ls` rather than a stat per slug: one process reports everything the last
+  // run already downloaded, and the queue is held back until it answers so a
+  // cached logo is never re-fetched.
+  Process {
+    id: remoteScan
+    command: ["/usr/bin/ls", "-1", root.remoteIconDir]
+    stdout: SplitParser {
+      onRead: function(line) {
+        var name = String(line || "").trim()
+        var dot = name.lastIndexOf(".")
+        var slug = dot > 0 ? name.slice(0, dot) : name
+        if (slug === "") return
+        var ready = root.remoteReady
+        ready[slug] = true
+        root.remoteReady = ready
+      }
+    }
+    onExited: {
+      root.remoteScanDone = true
+      root.remoteRevision++
+    }
+  }
+
+  // Anything that changes which windows are on screen, or what is already in
+  // the logo cache, is a cue to go looking for logos that still need fetching.
+  // Kept off the model bindings on purpose.
+  Connections {
+    target: root
+    function onRevisionChanged() { root.collectRemoteIcons() }
+    function onDesktopRevisionChanged() { root.collectRemoteIcons() }
+    function onRemoteRevisionChanged() { root.collectRemoteIcons() }
+  }
+
+  // Every download is settled through one place: mark the slug ready or
+  // failed, advance the queue, and only then offer the next candidate of a
+  // failed chain a try.
+  function settleRemote(slug, rest, ready) {
+    var readyMap = root.remoteReady
+    var failedMap = root.remoteFailed
+    if (ready) readyMap[slug] = true
+    else failedMap[slug] = true
+    root.remoteReady = readyMap
+    root.remoteFailed = failedMap
+    root.remoteRevision++
+    root.pumpRemoteQueue()
+    // A miss only means this guess was wrong, so the window's next candidate
+    // is worth a try.
+    if (!ready && rest.length > 0) root.requestRemoteIcon(rest)
+  }
+
+  // One process settles the whole pipeline so no step can be raced apart. It
+  // verifies the private cache directory by the descriptor it holds, writes
+  // only to an unpredictable exclusive 0600 temp file through an already-open
+  // descriptor, validates the very bytes written, and atomically renames the
+  // result into place within the same verified directory.
+  readonly property string remoteFetchScript: `
+set -eu
+set -o pipefail
+export LC_ALL=C
+
+dir=$1
+url=$2
+maxbytes=$3
+target=$4
+
+# The cache lives under the user's own cache home. Refuse a directory that was
+# pre-placed as a symlink, create it if missing, pin it open by descriptor and
+# verify that descriptor really is an owner-only directory before anything is
+# written there.
+[ ! -L "$dir" ]
+/usr/bin/mkdir -p -- "$dir"
+[ ! -L "$dir" ]
+exec 9< "$dir"
+[ -d "$dir" ]
+[ "$(/usr/bin/id -u)" = "$(/usr/bin/stat -Lc %u /proc/self/fd/9)" ]
+[ -d /proc/self/fd/9 ]
+/usr/bin/chmod 700 /proc/self/fd/9
+cd /proc/self/fd/9
+
+# An unpredictable, exclusive, owner-only temporary file. O_EXCL means creation
+# never clobbers an existing entry - symlink or not - and the random name gives
+# an attacker nothing to pre-position. Everything after this line is relative to
+# the verified directory above, so a swapped path cannot redirect the writes.
+tmp=$(/usr/bin/mktemp .tmp.XXXXXX)
+trap '/usr/bin/rm -f -- "$tmp"' EXIT HUP INT TERM
+exec 4> "$tmp"
+
+# Stream the bounded response into the descriptor already held rather than
+# re-opening a path, so the only inode ever written is the one just created.
+# --max-filesize stops a declared size up front and the pipe cut bounds the
+# bytes that actually reach disk even without a Content-Length header.
+if ! /usr/bin/curl -fsSL --max-time 10 --max-filesize "$maxbytes" -- "$url" | /usr/bin/head -c "$(($maxbytes + 1))" >&4; then
+  exit 1
+fi
+
+# Anything over the cap, or anything file does not recognise as an image, is
+# discarded rather than cached. Both checks read the very bytes that were
+# streamed, from the same file that is about to become the cache entry.
+[ "$(/usr/bin/stat -c %s /proc/self/fd/4)" -le "$maxbytes" ]
+mime=$(/usr/bin/file -b --mime-type "$tmp")
+case "$mime" in
+  image/*) ;;
+  *) exit 1 ;;
+esac
+
+# Atomic replace within this same verified, owner-only directory.
+/usr/bin/mv -f -- "$tmp" "$target"
+trap - EXIT HUP INT TERM
+`
+
+  Process {
+    id: remoteFetch
+    property string slug: ""
+    property var rest: []
+    command: ["/usr/bin/bash", "-c", root.remoteFetchScript, "advanced-workspaces",
+              root.remoteIconDir,
+              root.remoteIconSource.replace("{slug}", remoteFetch.slug),
+              String(root.remoteMaxBytes),
+              root.remoteFileName(remoteFetch.slug) + ".png"]
+    onExited: function(exitCode) {
+      root.settleRemote(remoteFetch.slug, remoteFetch.rest, exitCode === 0)
+    }
+  }
+
+  function ensureRemoteScan() {
+    if (root.remoteScanStarted || !root.remoteIcons) return
+    root.remoteScanStarted = true
+    remoteScan.running = true
+  }
+
+  // One fetch at a time. There are only ever a handful of slugs and the glyph
+  // stands in until the file lands, so a queue costs nothing where a burst of
+  // curls on session restore would not.
+  function pumpRemoteQueue() {
+    if (remoteFetch.running) return
+    var queue = root.remoteQueue
+    if (queue.length === 0) return
+    var next = queue[0]
+    remoteFetch.slug = next.slug
+    remoteFetch.rest = next.rest
+    root.remoteQueue = queue.slice(1)
+    remoteFetch.running = true
+  }
+
+  // Queues the first candidate that is not already settled, so a chain resumes
+  // from wherever it stopped rather than retrying a slug that 404s.
+  function requestRemoteIcon(candidates) {
+    if (!root.remoteIcons || !candidates) return
+    for (var i = 0; i < candidates.length; i++) {
+      var slug = candidates[i]
+      if (slug === "") continue
+      if (root.remoteReady[slug] || root.remotePending[slug] || root.remoteFailed[slug]) continue
+      var pending = root.remotePending
+      pending[slug] = true
+      root.remotePending = pending
+      var queue = root.remoteQueue.slice()
+      queue.push({ slug: slug, rest: candidates.slice(i + 1) })
+      root.remoteQueue = queue
+      root.pumpRemoteQueue()
+      return
+    }
+  }
+
+  // Whether a chain still has a candidate worth fetching. One that already
+  // resolved has nothing to do, and one already queued would only duplicate the
+  // request.
+  function remoteCandidatesWanted(candidates) {
+    for (var i = 0; i < candidates.length; i++) {
+      if (candidates[i] === "") continue
+      if (root.remoteReady[candidates[i]] || root.remotePending[candidates[i]]) return false
+    }
+    return candidates.length > 0
+  }
+
+  // Brand-slug guesses for a window, most likely first: a brand the rule table
+  // named, then the desktop entry's `Icon=` (`code` -> `vscode`,
+  // `vivaldi-stable` -> `vivaldi`), then its id, then the window class. A wrong
+  // guess only 404s, and is remembered rather than retried.
+  function remoteCandidatesFor(cls, rule) {
+    if (rule.site || rule.logo !== "") return rule.logo !== "" ? [rule.logo] : []
+    var entry = root.desktopEntryFor(cls)
+    var values = []
+    if (entry) values.push(entry.icon, entry.id)
+    values.push(cls)
+    return IconLogic.remoteCandidates(values)
+  }
+
+  // Downloads are requested from here rather than from the icon model. The
+  // model runs inside bindings, and starting processes from there would make
+  // the binding both read and write widget state, which QML reports as a
+  // binding loop and then breaks.
+  function collectRemoteIcons() {
+    if (!root.remoteIcons) return
+    root.ensureRemoteScan()
+    // Hold off until the scan reports what is already on disk, or logos cached
+    // by an earlier run would be fetched again.
+    if (!root.remoteScanDone) return
+
+    var workspaces = []
+    var ids = root.visibleIds
+    for (var i = 0; i < ids.length; i++) {
+      var workspace = root.workspaceById(ids[i])
+      if (workspace) workspaces.push(workspace)
+    }
+    if (root.scratchpadWorkspace) workspaces.push(root.scratchpadWorkspace)
+
+    for (var w = 0; w < workspaces.length; w++) {
+      var tops = workspaces[w].toplevels ? workspaces[w].toplevels.values : null
+      if (!tops) continue
+      for (var t = 0; t < tops.length; t++) {
+        var cls = root.windowClass(tops[t])
+        var title = root.windowTitle(tops[t])
+        if (!cls && !title) continue
+        var rule = IconRules.match(cls.toLowerCase(), title.toLowerCase())
+        // The user pinned this window down by hand; there is nothing to look up.
+        if (root.overrideIconFor(cls, title)) continue
+        // A local icon, or a site rule with no brand behind it, means there is
+        // nothing to fetch.
+        if (rule.site && rule.logo === "") continue
+        if (!rule.site && root.systemIconSource(cls) !== "") continue
+        var candidates = root.remoteCandidatesFor(cls, rule)
+        if (root.remoteCandidatesWanted(candidates)) root.requestRemoteIcon(candidates)
+      }
+    }
+  }
+
+  // The cached logo URL, or "" while it is still missing. Purely a read:
+  // missing logos are queued by collectRemoteIcons and the glyph stands in
+  // until the file lands.
+  function remoteLogo(candidates) {
+    var _ = root.remoteRevision
+    if (!root.remoteIcons || !candidates) return ""
+    for (var i = 0; i < candidates.length; i++) {
+      if (root.remoteReady[candidates[i]]) return Util.fileUrl(root.remoteTarget(candidates[i]))
+    }
+    return ""
+  }
+
+  // The user's override for a window, already reduced to something drawable, or
+  // null. Kept separate from iconEntryFor so collectRemoteIcons can skip a
+  // window the user has pinned down by hand.
+  function overrideIconFor(cls, title) {
+    if (!root.iconOverrides) return null
+    var value = IconLogic.lookupOverride(root.iconOverrides, cls, title)
+    return IconLogic.classifyOverride(value, function(name) {
+      return Quickshell.iconPath(name, true)
+    })
+  }
+
+  // One entry per visible window: a logo when one resolves, otherwise the glyph
+  // the rule table picked. Purely a read — see collectRemoteIcons for what
+  // actually goes and fetches.
+  function iconEntryFor(toplevel) {
+    var cls = root.windowClass(toplevel)
+    var title = root.windowTitle(toplevel)
+    if (!cls && !title) return { glyph: IconRules.fallback, source: "" }
+
+    var rule = IconRules.match(cls.toLowerCase(), title.toLowerCase())
+
+    // An override is the user telling us what this window is, so it outranks
+    // even the site table.
+    var override = root.overrideIconFor(cls, title)
+    if (override) {
+      return override.kind === "image"
+        ? { glyph: rule.icon, source: override.source }
+        : { glyph: override.value, source: "" }
+    }
+
+    // A site rule describes what the window is showing, so it outranks the
+    // application: a GitHub tab is a GitHub tab, not a browser.
+    if (!rule.site) {
+      var local = root.systemIconSource(cls)
+      if (local !== "") return { glyph: rule.icon, source: local }
+    }
+
+    return { glyph: rule.icon, source: root.remoteLogo(root.remoteCandidatesFor(cls, rule)) }
+  }
+
+  function iconEntriesFor(workspace) {
+    var _ = root.desktopRevision
+    var __ = root.remoteRevision
+    if (!root.showIcons || !workspace) return []
+    var tops = workspace.toplevels ? workspace.toplevels.values : null
+    if (!tops || tops.length === 0) return []
+
+    var shown = root.maxIcons > 0 ? Math.min(tops.length, root.maxIcons) : tops.length
+    var entries = []
+    for (var i = 0; i < shown; i++) entries.push(root.iconEntryFor(tops[i]))
+    if (tops.length > shown) entries.push({ glyph: "+" + (tops.length - shown), source: "" })
+    return entries
+  }
+
+  // Global ids are what Hyprland dispatches on; the label is the only thing
+  // local numbering touches.
+  function displayWorkspaceId(id) {
+    return root.localWorkspaceNumbers ? ((id - 1) % root.workspacesPerMonitor) + 1 : id
+  }
+
+  function focusWorkspace(id) {
+    var workspace = root.workspaceById(id)
+    if (workspace) {
+      workspace.activate()
+      return
+    }
+    // A synthesised empty number has nothing to activate, so it goes out as a
+    // dispatch, which creates the workspace the same way a keybind would.
+    if (!root.bar) return
+    root.bar.run("hyprctl dispatch " + Util.shellQuote('hl.dsp.focus({ workspace = "' + id + '" })'))
+  }
+
+  // --- layout --------------------------------------------------------------
+  implicitWidth: root.vertical ? root.barSize : strip.implicitWidth + root.trailingGap
+  implicitHeight: strip.implicitHeight
+
+  // A single window's logo, or its Nerd Font glyph when no logo resolved.
+  //
+  // Logos arrive in every shape and with their own padding baked in, so a bare
+  // circle next to a full-bleed square reads as two different sizes. Drawing
+  // each into a fixed rounded tile and clipping the artwork to it gives every
+  // window the same footprint whatever the source art does.
+  component WindowIcon: Item {
+    id: windowIcon
+    required property var modelData
+    property color tint: root.fgColor
+
+    readonly property string imageSource: String(windowIcon.modelData.source || "")
+    readonly property string glyphText: String(windowIcon.modelData.glyph || "")
+    // A source that fails to decode falls back to the glyph rather than
+    // leaving an empty tile behind.
+    readonly property bool hasLogo: windowIcon.imageSource !== "" && logo.status !== Image.Error
+
+    implicitWidth: windowIcon.hasLogo ? root.iconSize : glyph.implicitWidth
+    implicitHeight: windowIcon.hasLogo ? root.iconSize : glyph.implicitHeight
+
+    ClippingRectangle {
+      visible: windowIcon.hasLogo
+      anchors.centerIn: parent
+      width: root.iconSize
+      height: root.iconSize
+      radius: root.iconTileRadius
+      color: Util.alpha(root.fgColor, 0.12)
+
+      Image {
+        id: logo
+        anchors.fill: parent
+        source: windowIcon.imageSource
+        fillMode: Image.PreserveAspectFit
+        smooth: true
+        mipmap: true
+        // Decode at physical pixels: a logical-size decode leaves PNG icons
+        // upscaled and blurry on HiDPI displays.
+        sourceSize.width: Math.round(root.iconSize * root.devicePixelRatio)
+        sourceSize.height: Math.round(root.iconSize * root.devicePixelRatio)
+      }
+    }
+
+    Text {
+      id: glyph
+      visible: !windowIcon.hasLogo
+      text: windowIcon.glyphText
+      anchors.centerIn: parent
+      color: windowIcon.tint
+      font.family: root.bar ? root.bar.fontFamily : Style.font.family
+      font.pixelSize: root.vertical ? Style.font.icon : Style.font.body
+    }
+  }
+
+  Item {
+    id: strip
+    anchors.left: parent.left
+    anchors.right: root.vertical ? parent.right : undefined
+    anchors.top: parent.top
+    anchors.bottom: root.vertical ? undefined : parent.bottom
+    anchors.topMargin: root.vertical ? Style.spaceReal(80) : Style.spaceReal(4)
+    anchors.bottomMargin: root.vertical ? 0 : Style.spaceReal(4)
+    implicitWidth: grid.implicitWidth + Style.spaceReal(8)
+    implicitHeight: grid.implicitHeight + Style.spaceReal(8)
+
+    GridLayout {
+      id: grid
+      anchors.left: parent.left
+      anchors.leftMargin: Style.spaceReal(4)
+      anchors.right: parent.right
+      anchors.rightMargin: Style.spaceReal(4)
+      anchors.verticalCenter: parent.verticalCenter
+      columns: root.vertical ? 1 : Math.max(1, root.visibleIds.length + (root.scratchpadVisible ? 1 : 0))
+      columnSpacing: root.vertical ? 0 : Style.spaceReal(4)
+      rowSpacing: root.vertical ? Style.spaceReal(4) : 0
+
+      Repeater {
+        model: root.visibleIds
+
+        Rectangle {
+          id: pill
+          required property int modelData
+
+          readonly property int workspaceId: pill.modelData
+          readonly property var workspace: root.workspaceById(pill.workspaceId)
+          readonly property bool active: pill.workspaceId === root.activeId
+          readonly property bool urgent: pill.workspace !== null && pill.workspace.urgent === true
+          property bool hovered: false
+
+          radius: root.pillRadius
+          // A square-ish chip with a theme-coloured outline: the accent marks
+          // the workspace you are on, the foreground's normal border alpha
+          // marks the idle ones, and hover sits between the two. Both the fill
+          // and the border come from Style's state tokens, so a theme that
+          // wants quieter (or heavier) chrome can say so without a fork.
+          border.width: root.pillBorderWidth
+          border.color: pill.urgent ? root.urgentColor
+            : pill.active ? Style.selectedBorderFor(Color.accent, Color.accent, root.urgentColor)
+            : pill.hovered ? Style.hoverBorderFor(root.fgColor, Color.accent, root.urgentColor)
+            : Style.normalBorderFor(root.fgColor, Color.accent, root.urgentColor)
+          // Every pill carries a fill, from the theme's own control tokens:
+          // the workspace you are on takes the accent, the rest sit on the
+          // neutral idle fill so they read as pills instead of floating
+          // numbers, and hovering lifts one a step without reaching the accent.
+          // The alphas are the theme's (`normal-fill-alpha` and friends), so a
+          // theme that wants quieter pills can say so.
+          color: pill.urgent ? root.urgentColor
+            : pill.active ? Util.alpha(Color.accent, Style.selectedFillAlpha * (root.monitorFocused ? 1 : 0.45))
+            : pill.hovered ? Style.hoverFillFor(root.fgColor, Color.accent, root.urgentColor)
+            : Style.normalFillFor(root.fgColor, Color.accent, root.urgentColor)
+          opacity: 1
+
+          Layout.alignment: Qt.AlignVCenter
+          Layout.fillHeight: true
+          Layout.fillWidth: root.vertical
+          implicitWidth: root.vertical ? (root.barSize - Style.spaceReal(8)) : content.implicitWidth + Style.spaceReal(16)
+          implicitHeight: root.vertical ? content.implicitHeight + Style.spaceReal(10) : root.barSize - Style.spaceReal(8)
+
+          // RowLayout rather than Row: a Row only lays items out horizontally
+          // and leaves each at its own y, so a 13px tile beside a taller line of
+          // text sits high. A layout centres both when asked to.
+          RowLayout {
+            id: content
+            anchors.centerIn: parent
+            clip: true
+            spacing: root.iconGap
+
+            Text {
+              Layout.alignment: Qt.AlignVCenter
+              text: String(root.displayWorkspaceId(pill.workspaceId))
+              color: pill.urgent ? root.bgColor : root.fgColor
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: root.vertical ? Style.font.icon : Style.font.body
+            }
+
+            Repeater {
+              model: root.iconEntriesFor(pill.workspace)
+              delegate: WindowIcon {
+                Layout.alignment: Qt.AlignVCenter
+                tint: pill.urgent ? root.bgColor : root.fgColor
+              }
+            }
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onEntered: pill.hovered = true
+            onExited: pill.hovered = false
+            onClicked: root.focusWorkspace(pill.workspaceId)
+          }
+        }
+      }
+
+      // The scratchpad sits after the numbers, as the place windows go when
+      // they are not on any of them.
+      Rectangle {
+        id: scratchpad
+        visible: root.scratchpadVisible
+        property bool hovered: false
+
+        radius: root.pillRadius
+        border.width: root.pillBorderWidth
+        border.color: root.scratchpadOpen ? Style.selectedBorderFor(Color.accent, Color.accent, root.urgentColor)
+          : scratchpad.hovered ? Style.hoverBorderFor(root.fgColor, Color.accent, root.urgentColor)
+          : Style.normalBorderFor(root.fgColor, Color.accent, root.urgentColor)
+        // Same fill vocabulary as the workspace pills: accent while the stash
+        // is open on this monitor, the neutral idle fill while it only holds
+        // windows, one step up on hover.
+        color: scratchpad.hovered ? Style.hoverFillFor(root.fgColor, Color.accent, root.urgentColor)
+          : root.scratchpadOpen ? Util.alpha(Color.accent, Style.selectedFillAlpha * (root.monitorFocused ? 1 : 0.45))
+          : Style.normalFillFor(root.fgColor, Color.accent, root.urgentColor)
+        opacity: 1
+
+        Layout.alignment: Qt.AlignVCenter
+        Layout.fillHeight: true
+        Layout.fillWidth: root.vertical
+        implicitWidth: !scratchpad.visible ? 0
+          : root.vertical ? (root.barSize - Style.spaceReal(8))
+          : scratchpadContent.implicitWidth + Style.spaceReal(16)
+        implicitHeight: root.vertical ? scratchpadContent.implicitHeight + Style.spaceReal(10) : root.barSize - Style.spaceReal(8)
+
+        RowLayout {
+          id: scratchpadContent
+          anchors.centerIn: parent
+          clip: true
+          spacing: root.iconGap
+
+          Text {
+            Layout.alignment: Qt.AlignVCenter
+            text: root.scratchpadLabel
+            visible: text !== ""
+            color: root.fgColor
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: root.vertical ? Style.font.icon : Style.font.body
+          }
+
+          Repeater {
+            model: root.iconEntriesFor(root.scratchpadWorkspace)
+            delegate: WindowIcon {
+              Layout.alignment: Qt.AlignVCenter
+            }
+          }
+        }
+
+        MouseArea {
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onEntered: scratchpad.hovered = true
+          onExited: scratchpad.hovered = false
+          onClicked: root.toggleScratchpad()
+        }
+      }
+    }
+  }
+}
